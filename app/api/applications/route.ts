@@ -48,12 +48,26 @@ export async function POST(req: NextRequest) {
     console.log('Form data received');
    
     // Wyciągnij dane z formularza
-    const username = data.get('username') as string;
-    const email = data.get('email') as string;
-    const position = data.get('position') as string;
-    const whyThisPosition = data.get('whyThisPosition') as string;
-    const gdprConsent = data.get('gdprConsent') === 'true';
-    const language = (data.get('language') as string) || 'pl';
+  const username = data.get('username') as string;
+  const email = data.get('email') as string;
+  const position = data.get('position') as string;
+  const whyThisPosition = data.get('whyThisPosition') as string;
+  const gdprConsent = data.get('gdprConsent') === 'true';
+  const language = (data.get('language') as string) || 'pl';
+  const turnstileToken = data.get('turnstileToken') as string;
+    // Weryfikacja Cloudflare Turnstile
+    if (!turnstileToken) {
+      return NextResponse.json({ error: 'Brak tokena CAPTCHA' }, { status: 400 });
+    }
+    const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `secret=${process.env.CF_TURNSTILE_SECRET_KEY}&response=${turnstileToken}`
+    });
+    const verifyJson = await verifyRes.json();
+    if (!verifyJson.success) {
+      return NextResponse.json({ error: 'Weryfikacja CAPTCHA nie powiodła się' }, { status: 400 });
+    }
    
     console.log('Extracted data:', { username, email, position, gdprConsent, language });
    

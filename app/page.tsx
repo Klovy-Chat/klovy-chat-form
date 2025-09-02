@@ -1,6 +1,16 @@
 "use client";
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CheckCircle, Upload, User, Mail, Briefcase, FileText, Shield, Send, AlertCircle } from 'lucide-react';
+
+// Extend Window interface for Turnstile
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (element: HTMLElement, options: any) => void;
+      reset: (widgetId?: string) => void;
+    };
+  }
+}
 
 interface FormData {
   username: string;
@@ -9,6 +19,7 @@ interface FormData {
   files: File[];
   whyThisPosition: string;
   gdprConsent: boolean;
+  turnstileToken: string;
 }
 
 interface FormErrors {
@@ -58,7 +69,8 @@ const translations = {
     maxFiles: 'Możesz dodać maksymalnie 10 plików',
     removeFile: 'Usuń',
     sending: 'Wysyłanie...',
-    other: 'Inne'
+    other: 'Inne',
+    captchaError: 'Potwierdź, że nie jesteś botem (CAPTCHA)'
   },
   en: {
     usernameLabel: 'Username *',
@@ -97,11 +109,12 @@ const translations = {
     maxFiles: 'You can add a maximum of 10 files',
     removeFile: 'Remove',
     sending: 'Sending...',
-    other: 'Other'
+    other: 'Other',
+    captchaError: 'Please confirm you are not a robot (CAPTCHA)'
   }
 };
 
-// Hook do zarządzania localStorage z SSR safety
+// Hook to manage localStorage with SSR safety
 const useLocalStorage = (key: string, initialValue: 'pl' | 'en') => {
   const [storedValue, setStoredValue] = useState<'pl' | 'en'>(initialValue);
   const [isHydrated, setIsHydrated] = useState(false);
@@ -110,17 +123,17 @@ const useLocalStorage = (key: string, initialValue: 'pl' | 'en') => {
     setIsHydrated(true);
     try {
       const item = window.localStorage.getItem(key);
-      if (item) {
-        setStoredValue(item as 'pl' | 'en');
+      if (item && (item === 'pl' || item === 'en')) {
+        setStoredValue(item);
       } else {
-        // Fallback na język przeglądarki jeśli nie ma w localStorage
+        // Fallback to browser language if not in localStorage
         const browserLang = navigator.language.toLowerCase();
         const detectedLang = browserLang.startsWith('pl') ? 'pl' : 'en';
         setStoredValue(detectedLang);
         window.localStorage.setItem(key, detectedLang);
       }
     } catch (error) {
-      console.log(error);
+      console.warn('localStorage access failed:', error);
     }
   }, [key]);
 
@@ -131,7 +144,7 @@ const useLocalStorage = (key: string, initialValue: 'pl' | 'en') => {
         window.localStorage.setItem(key, value);
       }
     } catch (error) {
-      console.log(error);
+      console.warn('localStorage write failed:', error);
     }
   };
 
@@ -145,19 +158,63 @@ export default function KlovyChatApplicationForm() {
     position: '',
     files: [],
     whyThisPosition: '',
-    gdprConsent: false
+    gdprConsent: false,
+    turnstileToken: ''
   });
-
+  
   const [errors, setErrors] = useState<FormErrors>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [lang, setLang, isHydrated] = useLocalStorage('preferred-language', 'pl');
+  const turnstileRef = useRef<HTMLDivElement>(null);
+  const [turnstileLoaded, setTurnstileLoaded] = useState(false);
 
   const t = translations[lang];
 
+  // Load Turnstile script and render widget only once
+  useEffect(() => {
+    if (window.turnstile) return;
+    const script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+    script.async = true;
+    script.onload = () => {
+      if (window.turnstile && turnstileRef.current) {
+        window.turnstile.render(turnstileRef.current, {
+          sitekey: process.env.NEXT_PUBLIC_CF_TURNSTILE_SITE_KEY || 'YOUR_SITE_KEY_HERE',
+          callback: (token: string) => {
+            setFormData(prev => ({ ...prev, turnstileToken: token }));
+            if (errors.gdprConsent && errors.gdprConsent.includes('CAPTCHA')) {
+              setErrors(prev => ({ ...prev, gdprConsent: undefined }));
+            }
+          },
+          'expired-callback': () => {
+            setFormData(prev => ({ ...prev, turnstileToken: '' }));
+          },
+          'error-callback': () => {
+            setFormData(prev => ({ ...prev, turnstileToken: '' }));
+          }
+        });
+      }
+    };
+    script.onerror = () => {
+      console.error('Failed to load Turnstile script');
+    };
+    document.body.appendChild(script);
+    return () => {
+      const existingScript = document.querySelector(`script[src="${script.src}"]`);
+      if (existingScript) {
+        document.body.removeChild(existingScript);
+      }
+    };
+  }, [errors.gdprConsent]);
+
   // Global CSS injection for scrollbar styling
   useEffect(() => {
+    const styleId = 'klovy-scrollbar-styles';
+    if (document.getElementById(styleId)) return;
+    
     const style = document.createElement('style');
+    style.id = styleId;
     style.innerHTML = `
       /* Webkit browsers */
       ::-webkit-scrollbar {
@@ -182,36 +239,54 @@ export default function KlovyChatApplicationForm() {
       }
     `;
     document.head.appendChild(style);
+    
     return () => {
-      document.head.removeChild(style);
+      const styleElement = document.getElementById(styleId);
+      if (styleElement) {
+        document.head.removeChild(styleElement);
+      }
     };
   }, []);
 
   // Inject global CSS for placeholder color
   useEffect(() => {
+    const styleId = 'klovy-placeholder-styles';
+    if (document.getElementById(styleId)) return;
+    
     const style = document.createElement('style');
+    style.id = styleId;
     style.innerHTML = `
-      input::placeholder, textarea::placeholder, select::placeholder {
+      .klovy-form input::placeholder, 
+      .klovy-form textarea::placeholder, 
+      .klovy-form select::placeholder {
         color: #6b7280 !important;
         font-weight: 400 !important;
         opacity: 1 !important;
       }
-      input, textarea, select {
+      .klovy-form input, 
+      .klovy-form textarea, 
+      .klovy-form select {
         color: #374151 !important;
         font-weight: 500 !important;
       }
-      input:focus, textarea:focus, select:focus {
+      .klovy-form input:focus, 
+      .klovy-form textarea:focus, 
+      .klovy-form select:focus {
         color: #111827 !important;
         font-weight: 500 !important;
       }
     `;
     document.head.appendChild(style);
+    
     return () => {
-      document.head.removeChild(style);
+      const styleElement = document.getElementById(styleId);
+      if (styleElement) {
+        document.head.removeChild(styleElement);
+      }
     };
   }, []);
 
-  // Pokaż loading lub domyślny język do momentu hydratacji
+  // Show loading until hydration
   if (!isHydrated) {
     return (
       <main className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-indigo-50 py-8 px-4 flex items-center justify-center">
@@ -256,8 +331,9 @@ export default function KlovyChatApplicationForm() {
       newErrors.position = t.errorPosition;
     }
 
-    if (!formData.files || formData.files.length === 0) {
-      newErrors.cv = t.errorFiles;
+    // Pliki są opcjonalne, ale max 10
+    if (formData.files.length > 10) {
+      newErrors.cv = t.maxFiles;
     }
 
     if (!formData.whyThisPosition.trim()) {
@@ -266,6 +342,13 @@ export default function KlovyChatApplicationForm() {
 
     if (!formData.gdprConsent) {
       newErrors.gdprConsent = t.errorGdpr;
+    }
+
+    // Check for CAPTCHA token
+    if (!formData.turnstileToken) {
+      newErrors.gdprConsent = newErrors.gdprConsent 
+        ? `${newErrors.gdprConsent} ${t.captchaError}`
+        : t.captchaError;
     }
 
     setErrors(newErrors);
@@ -293,11 +376,14 @@ export default function KlovyChatApplicationForm() {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newFiles = Array.from(e.target.files || []);
-    const tooBig = newFiles.some(f => f.size > 10 * 1024 * 1024);
-    if (tooBig) {
+    
+    // Check file sizes
+    const tooBigFiles = newFiles.filter(f => f.size > 10 * 1024 * 1024);
+    if (tooBigFiles.length > 0) {
       setErrors(prev => ({ ...prev, cv: t.fileTooLarge }));
       return;
     }
+    
     // Combine existing files with new ones, but max 10
     setFormData(prev => {
       const combined = [...prev.files, ...newFiles].slice(0, 10);
@@ -309,11 +395,23 @@ export default function KlovyChatApplicationForm() {
       }
       return { ...prev, files: combined };
     });
+    
+    // Reset file input
+    e.target.value = '';
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!validateForm()) return;
+    
+    if (!validateForm()) {
+      // Scroll to first error
+      const firstErrorElement = document.querySelector('.border-red-300');
+      if (firstErrorElement) {
+        firstErrorElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      return;
+    }
+
     setIsSubmitting(true);
     
     try {
@@ -323,28 +421,40 @@ export default function KlovyChatApplicationForm() {
       formDataToSend.append('position', formData.position);
       formDataToSend.append('whyThisPosition', formData.whyThisPosition);
       formDataToSend.append('gdprConsent', formData.gdprConsent.toString());
-      formDataToSend.append('language', lang); // Dodaj język
+      formDataToSend.append('language', lang);
+      formDataToSend.append('turnstileToken', formData.turnstileToken);
       
-      // Dodaj pliki
       formData.files.forEach((file, index) => {
         formDataToSend.append(`file${index + 1}`, file);
       });
-      
+
       const response = await fetch('/api/applications', {
         method: 'POST',
         body: formDataToSend,
       });
-      
+
       const result = await response.json();
-      
+
       if (!response.ok) {
         throw new Error(result.error || t.errorSend);
       }
-      
+
       setIsSubmitted(true);
     } catch (error) {
       console.error('Error submitting form:', error);
-      setErrors({ gdprConsent: error instanceof Error ? error.message : t.errorSend });
+      setErrors({ 
+        gdprConsent: error instanceof Error ? error.message : t.errorSend 
+      });
+      
+      // Reset CAPTCHA on error
+      if (window.turnstile && turnstileRef.current) {
+        try {
+          window.turnstile.reset();
+          setFormData(prev => ({ ...prev, turnstileToken: '' }));
+        } catch (resetError) {
+          console.error('Turnstile reset error:', resetError);
+        }
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -357,10 +467,20 @@ export default function KlovyChatApplicationForm() {
       position: '',
       files: [],
       whyThisPosition: '',
-      gdprConsent: false
+      gdprConsent: false,
+      turnstileToken: ''
     });
     setErrors({});
     setIsSubmitted(false);
+    
+    // Reset CAPTCHA
+    if (window.turnstile && turnstileRef.current) {
+      try {
+        window.turnstile.reset();
+      } catch (error) {
+        console.error('Turnstile reset error:', error);
+      }
+    }
   };
 
   if (isSubmitted) {
@@ -412,6 +532,7 @@ export default function KlovyChatApplicationForm() {
               className={`flex-1 py-2 px-3 rounded-full font-medium transition-all duration-300 text-sm z-10 relative ${
                 lang === 'pl' ? 'text-white' : 'text-gray-600 hover:text-gray-800'
               }`}
+              aria-pressed={lang === 'pl'}
             >
               PL
             </button>
@@ -421,6 +542,7 @@ export default function KlovyChatApplicationForm() {
               className={`flex-1 py-2 px-3 rounded-full font-medium transition-all duration-300 text-sm z-10 relative ${
                 lang === 'en' ? 'text-white' : 'text-gray-600 hover:text-gray-800'
               }`}
+              aria-pressed={lang === 'en'}
             >
               EN
             </button>
@@ -433,7 +555,7 @@ export default function KlovyChatApplicationForm() {
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-xl p-8 space-y-8">
+        <form onSubmit={handleSubmit} className="klovy-form bg-white rounded-2xl shadow-xl p-8 space-y-8">
           {/* Personal Information Section */}
           <div className="space-y-6">
             <h2 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
@@ -455,9 +577,11 @@ export default function KlovyChatApplicationForm() {
                   errors.username ? 'border-red-300 bg-red-50' : 'border-gray-200 focus:border-blue-500'
                 }`}
                 placeholder={t.usernamePlaceholder}
+                aria-invalid={errors.username ? 'true' : 'false'}
+                aria-describedby={errors.username ? 'username-error' : undefined}
               />
               {errors.username && (
-                <p className="mt-1 text-sm text-red-600 flex items-center gap-1">
+                <p id="username-error" className="mt-1 text-sm text-red-600 flex items-center gap-1">
                   <AlertCircle className="w-4 h-4" />
                   {errors.username}
                 </p>
@@ -479,9 +603,11 @@ export default function KlovyChatApplicationForm() {
                   errors.email ? 'border-red-300 bg-red-50' : 'border-gray-200 focus:border-blue-500'
                 }`}
                 placeholder={t.emailPlaceholder}
+                aria-invalid={errors.email ? 'true' : 'false'}
+                aria-describedby={errors.email ? 'email-error' : undefined}
               />
               {errors.email && (
-                <p className="mt-1 text-sm text-red-600 flex items-center gap-1">
+                <p id="email-error" className="mt-1 text-sm text-red-600 flex items-center gap-1">
                   <AlertCircle className="w-4 h-4" />
                   {errors.email}
                 </p>
@@ -510,6 +636,8 @@ export default function KlovyChatApplicationForm() {
                 className={`w-full px-4 py-3 border-2 rounded-xl transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 ${
                   errors.position ? 'border-red-300 bg-red-50' : 'border-gray-200 focus:border-blue-500'
                 }`}
+                aria-invalid={errors.position ? 'true' : 'false'}
+                aria-describedby={errors.position ? 'position-error' : undefined}
               >
                 <option value="">{t.positionPlaceholder}</option>
                 <option value="frontend-developer">Frontend Developer</option>
@@ -521,7 +649,7 @@ export default function KlovyChatApplicationForm() {
                 <option value="inne">{t.other}</option>
               </select>
               {errors.position && (
-                <p className="mt-1 text-sm text-red-600 flex items-center gap-1">
+                <p id="position-error" className="mt-1 text-sm text-red-600 flex items-center gap-1">
                   <AlertCircle className="w-4 h-4" />
                   {errors.position}
                 </p>
@@ -535,14 +663,16 @@ export default function KlovyChatApplicationForm() {
               </label>
               
               {formData.files.length > 0 && (
-                <ul className="mb-4 space-y-2">
+                <ul className="mb-4 space-y-2" role="list">
                   {formData.files.map((file, index) => (
                     <li key={index} className="flex items-center justify-between bg-gray-50 p-2 rounded-lg">
-                      <span className="text-sm text-gray-700 truncate">{file.name}</span>
+                      <span className="text-sm text-gray-700 truncate flex-1 mr-2" title={file.name}>
+                        {file.name}
+                      </span>
                       <button
                         type="button"
                         onClick={() => handleRemoveFile(index)}
-                        className="ml-2 px-2 py-1 text-xs text-red-600 bg-red-100 rounded hover:bg-red-200 transition-colors flex items-center gap-1"
+                        className="ml-2 px-2 py-1 text-xs text-red-600 bg-red-100 rounded hover:bg-red-200 transition-colors flex items-center gap-1 flex-shrink-0"
                         aria-label={`${t.removeFile} ${file.name}`}
                       >
                         <AlertCircle className="w-4 h-4" /> {t.removeFile}
@@ -563,6 +693,7 @@ export default function KlovyChatApplicationForm() {
                   accept="image/*,application/pdf,audio/*"
                   multiple
                   className="hidden"
+                  aria-describedby={errors.cv ? 'files-error' : undefined}
                 />
                 <label
                   htmlFor="files"
@@ -580,7 +711,7 @@ export default function KlovyChatApplicationForm() {
                 </label>
               </div>
               {errors.cv && (
-                <p className="mt-1 text-sm text-red-600 flex items-center gap-1">
+                <p id="files-error" className="mt-1 text-sm text-red-600 flex items-center gap-1">
                   <AlertCircle className="w-4 h-4" />
                   {errors.cv}
                 </p>
@@ -598,19 +729,27 @@ export default function KlovyChatApplicationForm() {
                 value={formData.whyThisPosition}
                 onChange={handleInputChange}
                 rows={8}
+                maxLength={1000}
                 className={`w-full px-4 py-3 border-2 rounded-xl transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none ${
                   errors.coverLetter ? 'border-red-300 bg-red-50' : 'border-gray-200 focus:border-blue-500'
                 }`}
                 placeholder={t.whyPlaceholder}
+                aria-invalid={errors.coverLetter ? 'true' : 'false'}
+                aria-describedby={errors.coverLetter ? 'why-error' : 'why-counter'}
               />
               <div className="flex justify-between items-center mt-1">
                 {errors.coverLetter && (
-                  <p className="text-sm text-red-600 flex items-center gap-1">
+                  <p id="why-error" className="text-sm text-red-600 flex items-center gap-1">
                     <AlertCircle className="w-4 h-4" />
                     {errors.coverLetter}
                   </p>
                 )}
-                <span className="text-xs ml-auto text-gray-500">
+                <span 
+                  id="why-counter" 
+                  className={`text-xs ml-auto ${
+                    formData.whyThisPosition.length > 900 ? 'text-orange-600' : 'text-gray-500'
+                  }`}
+                >
                   {formData.whyThisPosition.length}/1000 {t.minCounter}
                 </span>
               </div>
@@ -619,14 +758,13 @@ export default function KlovyChatApplicationForm() {
 
           <hr className="border-gray-200" />
 
-          {/* GDPR Section */}
+          {/* GDPR Section + CAPTCHA */}
           <div className="space-y-4">
             <h2 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
               <Shield className="w-5 h-5 text-blue-600" />
               {t.gdprSection}
             </h2>
-            
-            <div className="bg-gray-50 rounded-xl p-4">
+            <div className="bg-gray-50 rounded-xl p-4 space-y-4">
               <label htmlFor="gdprConsent" className="flex items-start gap-3 cursor-pointer">
                 <input
                   type="checkbox"
@@ -634,14 +772,22 @@ export default function KlovyChatApplicationForm() {
                   name="gdprConsent"
                   checked={formData.gdprConsent}
                   onChange={handleInputChange}
-                  className="mt-1 w-4 h-4 text-blue-600 border-2 border-gray-300 rounded focus:ring-blue-500"
+                  className="mt-1 w-4 h-4 text-blue-600 border-2 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                  aria-invalid={errors.gdprConsent ? 'true' : 'false'}
+                  aria-describedby={errors.gdprConsent ? 'gdpr-error' : undefined}
                 />
                 <span className="text-sm text-gray-700 leading-relaxed">
                   {t.gdprLabel}
                 </span>
               </label>
+              
+              {/* Cloudflare Turnstile CAPTCHA */}
+              <div className="mt-4">
+                <div ref={turnstileRef} className="flex justify-center" />
+              </div>
+              
               {errors.gdprConsent && (
-                <p className="mt-2 text-sm text-red-600 flex items-center gap-1">
+                <p id="gdpr-error" className="mt-2 text-sm text-red-600 flex items-center gap-1">
                   <AlertCircle className="w-4 h-4" />
                   {errors.gdprConsent}
                 </p>
@@ -653,12 +799,13 @@ export default function KlovyChatApplicationForm() {
           <div className="pt-4">
             <button
               type="submit"
-              disabled={isSubmitting}
+              disabled={isSubmitting || !formData.turnstileToken}
               className={`w-full py-4 px-6 rounded-xl font-semibold text-white transition-all duration-200 flex items-center justify-center gap-2 ${
-                isSubmitting
+                isSubmitting || !formData.turnstileToken
                   ? 'bg-gray-400 cursor-not-allowed'
                   : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 transform hover:scale-[1.02] shadow-lg hover:shadow-xl'
               }`}
+              aria-disabled={isSubmitting || !formData.turnstileToken}
             >
               {isSubmitting ? (
                 <>
@@ -672,12 +819,26 @@ export default function KlovyChatApplicationForm() {
                 </>
               )}
             </button>
+            
+            {errors.gdprConsent && errors.gdprConsent.includes('CAPTCHA') && (
+              <p className="text-xs text-gray-500 text-center mt-2">
+                Please complete the CAPTCHA verification above
+              </p>
+            )}
           </div>
         </form>
 
         {/* Footer */}
         <div className="text-center mt-8 text-gray-500 text-sm">
-          <p>{t.contact} <a href="mailto:recruitment@klovy.org" className="text-blue-600 hover:underline">recruitment@klovy.org</a></p>
+          <p>
+            {t.contact}{' '}
+            <a 
+              href="mailto:recruitment@klovy.org" 
+              className="text-blue-600 hover:underline focus:underline focus:outline-none"
+            >
+              recruitment@klovy.org
+            </a>
+          </p>
         </div>
       </div>
     </main>
